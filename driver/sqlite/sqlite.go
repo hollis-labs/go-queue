@@ -1,0 +1,242 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	queue "github.com/hollis-labs/go-queue"
+	_ "modernc.org/sqlite"
+)
+
+// Opts configures the SQLite driver.
+type Opts struct {
+	// Table is the name of the jobs table. Default: "jobs".
+	Table string
+	// FailedTable is the name of the failed jobs table. Default: "failed_jobs".
+	FailedTable string
+	// RetryAfter is the duration after which a reserved job is considered
+	// stuck and can be reclaimed by Pop. Default: 60s.
+	RetryAfter time.Duration
+}
+
+// Driver is a SQLite-backed Queue implementation.
+type Driver struct {
+	db          *sql.DB
+	table       string
+	failedTable string
+	retryAfter  time.Duration
+}
+
+// New creates the required tables (if not present) and returns a Driver.
+func New(db *sql.DB, opts Opts) (*Driver, error) {
+	if opts.Table == "" {
+		opts.Table = defaultJobsTable
+	}
+	if opts.FailedTable == "" {
+		opts.FailedTable = defaultFailedTable
+	}
+	if opts.RetryAfter == 0 {
+		opts.RetryAfter = 60 * time.Second
+	}
+
+	if err := createTables(db, opts.Table, opts.FailedTable); err != nil {
+		return nil, fmt.Errorf("sqlite driver: create tables: %w", err)
+	}
+
+	return &Driver{
+		db:          db,
+		table:       opts.Table,
+		failedTable: opts.FailedTable,
+		retryAfter:  opts.RetryAfter,
+	}, nil
+}
+
+// Push enqueues a new job.
+func (d *Driver) Push(_ context.Context, jobType string, payload []byte, opts ...queue.PushOption) error {
+	cfg := queue.ResolvePushConfig(opts)
+	now := time.Now().UTC().Unix()
+	availableAt := now + int64(cfg.Delay.Seconds())
+
+	_, err := d.db.Exec(
+		`INSERT INTO `+d.table+` (queue, type, payload, max_tries, available_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		cfg.Queue, jobType, payload, cfg.MaxTries, availableAt, now,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite push: %w", err)
+	}
+	return nil
+}
+
+// Pop retrieves and reserves the next available job from the named queue.
+// Returns nil, nil when the queue is empty.
+func (d *Driver) Pop(_ context.Context, queueName string) (*queue.QueuedJob, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("sqlite pop begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	now := time.Now().UTC().Unix()
+	retryThreshold := now - int64(d.retryAfter.Seconds())
+
+	var (
+		id          int64
+		jobType     string
+		jobPayload  []byte
+		attempts    int
+		maxTries    int
+		createdAt   int64
+		availableAt int64
+		reservedAt  *int64
+	)
+
+	err = tx.QueryRow(
+		`SELECT id, type, payload, attempts, max_tries, created_at, available_at, reserved_at
+		 FROM `+d.table+`
+		 WHERE queue = ?
+		   AND ((reserved_at IS NULL AND available_at <= ?) OR (reserved_at IS NOT NULL AND reserved_at <= ?))
+		 ORDER BY id ASC
+		 LIMIT 1`,
+		queueName, now, retryThreshold,
+	).Scan(&id, &jobType, &jobPayload, &attempts, &maxTries, &createdAt, &availableAt, &reservedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite pop select: %w", err)
+	}
+
+	newAttempts := attempts + 1
+	_, err = tx.Exec(
+		`UPDATE `+d.table+` SET reserved_at = ?, attempts = ? WHERE id = ?`,
+		now, newAttempts, id,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite pop update: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("sqlite pop commit: %w", err)
+	}
+
+	var reservedAtTime *time.Time
+	if reservedAt != nil {
+		t := time.Unix(*reservedAt, 0).UTC()
+		reservedAtTime = &t
+	}
+
+	job := &queue.QueuedJob{
+		ID:          fmt.Sprintf("%d", id),
+		Type:        jobType,
+		Queue:       queueName,
+		Payload:     jobPayload,
+		Attempts:    newAttempts,
+		MaxTries:    maxTries,
+		CreatedAt:   time.Unix(createdAt, 0).UTC(),
+		AvailableAt: time.Unix(availableAt, 0).UTC(),
+		ReservedAt:  reservedAtTime,
+	}
+	return job, nil
+}
+
+// Delete removes a completed job from the queue.
+func (d *Driver) Delete(_ context.Context, id string) error {
+	_, err := d.db.Exec(`DELETE FROM `+d.table+` WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("sqlite delete: %w", err)
+	}
+	return nil
+}
+
+// Release puts a job back on the queue with a delay, preserving its attempt count.
+func (d *Driver) Release(_ context.Context, id string, delay time.Duration) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("sqlite release begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var (
+		jobType     string
+		queueName   string
+		payload     []byte
+		attempts    int
+		maxTries    int
+		createdAt   int64
+	)
+
+	err = tx.QueryRow(
+		`SELECT type, queue, payload, attempts, max_tries, created_at FROM `+d.table+` WHERE id = ?`,
+		id,
+	).Scan(&jobType, &queueName, &payload, &attempts, &maxTries, &createdAt)
+	if err != nil {
+		return fmt.Errorf("sqlite release select: %w", err)
+	}
+
+	_, err = tx.Exec(`DELETE FROM `+d.table+` WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("sqlite release delete: %w", err)
+	}
+
+	now := time.Now().UTC().Unix()
+	availableAt := now + int64(delay.Seconds())
+
+	_, err = tx.Exec(
+		`INSERT INTO `+d.table+` (queue, type, payload, attempts, max_tries, available_at, created_at, reserved_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+		queueName, jobType, payload, attempts, maxTries, availableAt, createdAt,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite release insert: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite release commit: %w", err)
+	}
+	return nil
+}
+
+// Size returns the total number of jobs on the named queue.
+func (d *Driver) Size(_ context.Context, queueName string) (int, error) {
+	var count int
+	err := d.db.QueryRow(
+		`SELECT COUNT(*) FROM `+d.table+` WHERE queue = ?`,
+		queueName,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite size: %w", err)
+	}
+	return count, nil
+}
+
+// Failed moves a job to the failed jobs store.
+func (d *Driver) Failed(_ context.Context, job *queue.QueuedJob, errMsg string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("sqlite failed begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	_, err = tx.Exec(`DELETE FROM `+d.table+` WHERE id = ?`, job.ID)
+	if err != nil {
+		return fmt.Errorf("sqlite failed delete: %w", err)
+	}
+
+	now := time.Now().UTC().Unix()
+	_, err = tx.Exec(
+		`INSERT INTO `+d.failedTable+` (queue, type, payload, error, attempts, failed_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		job.Queue, job.Type, job.Payload, errMsg, job.Attempts, now,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite failed insert: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite failed commit: %w", err)
+	}
+	return nil
+}
