@@ -3,6 +3,8 @@ package sqlite_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -371,5 +373,55 @@ func TestSQLiteStuckJobReclaim(t *testing.T) {
 	}
 	if job2.Attempts != 2 {
 		t.Errorf("attempts after reclaim: want 2, got %d", job2.Attempts)
+	}
+}
+
+func TestSQLiteConcurrentPop(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	// Limit to one connection so all goroutines share the same in-memory DB.
+	db.SetMaxOpenConns(1)
+	q, err := qsqlite.New(db, qsqlite.Opts{})
+	if err != nil {
+		t.Fatalf("new driver: %v", err)
+	}
+
+	// Push 100 jobs.
+	for i := 0; i < 100; i++ {
+		_ = q.Push(ctx, "concurrent", []byte(fmt.Sprintf(`{"i":%d}`, i)))
+	}
+
+	// Pop from 10 goroutines concurrently.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seen := make(map[string]bool)
+
+	for g := 0; g < 10; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				job, err := q.Pop(ctx, "default")
+				if err != nil {
+					t.Errorf("Pop: %v", err)
+					return
+				}
+				if job == nil {
+					return
+				}
+				mu.Lock()
+				if seen[job.ID] {
+					t.Errorf("duplicate job ID: %s", job.ID)
+				}
+				seen[job.ID] = true
+				mu.Unlock()
+				_ = q.Delete(ctx, job.ID)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(seen) != 100 {
+		t.Errorf("processed %d jobs, want 100", len(seen))
 	}
 }
