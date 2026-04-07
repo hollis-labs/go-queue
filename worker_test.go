@@ -2,6 +2,7 @@ package queue_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,8 @@ import (
 
 	queue "github.com/hollis-labs/go-queue"
 	"github.com/hollis-labs/go-queue/driver/memory"
+	qsqlite "github.com/hollis-labs/go-queue/driver/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 func TestWorkerDispatch(t *testing.T) {
@@ -260,6 +263,56 @@ func TestWorkerPriorityQueues(t *testing.T) {
 	}
 	if order[0] != `"high-1"` {
 		t.Fatalf("expected high-1 first, got %s (full order: %v)", order[0], order)
+	}
+}
+
+func TestWorkerWithSQLite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	db.Exec("PRAGMA journal_mode=WAL")
+
+	q, err := qsqlite.New(db, qsqlite.Opts{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var results []string
+	var mu sync.Mutex
+
+	w := queue.NewWorker(q, queue.WorkerOpts{
+		PollInterval:  10 * time.Millisecond,
+		MaxTries:      2,
+		RetryAfter:    0,
+		StopWhenEmpty: true,
+	})
+	w.Register("process", func(_ context.Context, job *queue.QueuedJob) error {
+		mu.Lock()
+		results = append(results, string(job.Payload))
+		mu.Unlock()
+		return nil
+	})
+
+	_ = q.Push(ctx, "process", []byte("a"))
+	_ = q.Push(ctx, "process", []byte("b"))
+	_ = q.Push(ctx, "process", []byte("c"))
+
+	_ = w.Start(ctx)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(results) != 3 {
+		t.Fatalf("processed %d jobs, want 3", len(results))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if results[i] != want {
+			t.Errorf("results[%d] = %q, want %q", i, results[i], want)
+		}
 	}
 }
 
