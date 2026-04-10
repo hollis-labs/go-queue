@@ -54,12 +54,17 @@ func New(db *sql.DB, opts Opts) (*Driver, error) {
 }
 
 // Push enqueues a new job.
-func (d *Driver) Push(_ context.Context, jobType string, payload []byte, opts ...queue.PushOption) error {
+func (d *Driver) Push(ctx context.Context, jobType string, payload []byte, opts ...queue.PushOption) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	cfg := queue.ResolvePushConfig(opts)
 	now := time.Now().UTC().Unix()
 	availableAt := now + int64(cfg.Delay.Seconds())
 
-	_, err := d.db.Exec(
+	_, err := d.db.ExecContext(
+		ctx,
 		`INSERT INTO `+d.table+` (queue, type, payload, max_tries, available_at, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		cfg.Queue, jobType, payload, cfg.MaxTries, availableAt, now,
@@ -72,8 +77,12 @@ func (d *Driver) Push(_ context.Context, jobType string, payload []byte, opts ..
 
 // Pop retrieves and reserves the next available job from the named queue.
 // Returns nil, nil when the queue is empty.
-func (d *Driver) Pop(_ context.Context, queueName string) (*queue.QueuedJob, error) {
-	tx, err := d.db.Begin()
+func (d *Driver) Pop(ctx context.Context, queueName string) (*queue.QueuedJob, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite pop begin: %w", err)
 	}
@@ -93,7 +102,8 @@ func (d *Driver) Pop(_ context.Context, queueName string) (*queue.QueuedJob, err
 		reservedAt  *int64
 	)
 
-	err = tx.QueryRow(
+	err = tx.QueryRowContext(
+		ctx,
 		`SELECT id, type, payload, attempts, max_tries, created_at, available_at, reserved_at
 		 FROM `+d.table+`
 		 WHERE queue = ?
@@ -110,7 +120,8 @@ func (d *Driver) Pop(_ context.Context, queueName string) (*queue.QueuedJob, err
 	}
 
 	newAttempts := attempts + 1
-	_, err = tx.Exec(
+	_, err = tx.ExecContext(
+		ctx,
 		`UPDATE `+d.table+` SET reserved_at = ?, attempts = ? WHERE id = ?`,
 		now, newAttempts, id,
 	)
@@ -143,8 +154,12 @@ func (d *Driver) Pop(_ context.Context, queueName string) (*queue.QueuedJob, err
 }
 
 // Delete removes a completed job from the queue.
-func (d *Driver) Delete(_ context.Context, id string) error {
-	_, err := d.db.Exec(`DELETE FROM `+d.table+` WHERE id = ?`, id)
+func (d *Driver) Delete(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	_, err := d.db.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("sqlite delete: %w", err)
 	}
@@ -152,23 +167,28 @@ func (d *Driver) Delete(_ context.Context, id string) error {
 }
 
 // Release puts a job back on the queue with a delay, preserving its attempt count.
-func (d *Driver) Release(_ context.Context, id string, delay time.Duration) error {
-	tx, err := d.db.Begin()
+func (d *Driver) Release(ctx context.Context, id string, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlite release begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
 	var (
-		jobType     string
-		queueName   string
-		payload     []byte
-		attempts    int
-		maxTries    int
-		createdAt   int64
+		jobType   string
+		queueName string
+		payload   []byte
+		attempts  int
+		maxTries  int
+		createdAt int64
 	)
 
-	err = tx.QueryRow(
+	err = tx.QueryRowContext(
+		ctx,
 		`SELECT type, queue, payload, attempts, max_tries, created_at FROM `+d.table+` WHERE id = ?`,
 		id,
 	).Scan(&jobType, &queueName, &payload, &attempts, &maxTries, &createdAt)
@@ -176,7 +196,7 @@ func (d *Driver) Release(_ context.Context, id string, delay time.Duration) erro
 		return fmt.Errorf("sqlite release select: %w", err)
 	}
 
-	_, err = tx.Exec(`DELETE FROM `+d.table+` WHERE id = ?`, id)
+	_, err = tx.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("sqlite release delete: %w", err)
 	}
@@ -184,7 +204,8 @@ func (d *Driver) Release(_ context.Context, id string, delay time.Duration) erro
 	now := time.Now().UTC().Unix()
 	availableAt := now + int64(delay.Seconds())
 
-	_, err = tx.Exec(
+	_, err = tx.ExecContext(
+		ctx,
 		`INSERT INTO `+d.table+` (queue, type, payload, attempts, max_tries, available_at, created_at, reserved_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
 		queueName, jobType, payload, attempts, maxTries, availableAt, createdAt,
@@ -200,9 +221,14 @@ func (d *Driver) Release(_ context.Context, id string, delay time.Duration) erro
 }
 
 // Size returns the total number of jobs on the named queue.
-func (d *Driver) Size(_ context.Context, queueName string) (int, error) {
+func (d *Driver) Size(ctx context.Context, queueName string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	var count int
-	err := d.db.QueryRow(
+	err := d.db.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM `+d.table+` WHERE queue = ?`,
 		queueName,
 	).Scan(&count)
@@ -213,20 +239,25 @@ func (d *Driver) Size(_ context.Context, queueName string) (int, error) {
 }
 
 // Failed moves a job to the failed jobs store.
-func (d *Driver) Failed(_ context.Context, job *queue.QueuedJob, errMsg string) error {
-	tx, err := d.db.Begin()
+func (d *Driver) Failed(ctx context.Context, job *queue.QueuedJob, errMsg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("sqlite failed begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	_, err = tx.Exec(`DELETE FROM `+d.table+` WHERE id = ?`, job.ID)
+	_, err = tx.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE id = ?`, job.ID)
 	if err != nil {
 		return fmt.Errorf("sqlite failed delete: %w", err)
 	}
 
 	now := time.Now().UTC().Unix()
-	_, err = tx.Exec(
+	_, err = tx.ExecContext(
+		ctx,
 		`INSERT INTO `+d.failedTable+` (queue, type, payload, error, attempts, failed_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		job.Queue, job.Type, job.Payload, errMsg, job.Attempts, now,

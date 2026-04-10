@@ -40,7 +40,11 @@ func New() *Driver {
 }
 
 // Push enqueues a new job.
-func (d *Driver) Push(_ context.Context, jobType string, payload []byte, opts ...queue.PushOption) error {
+func (d *Driver) Push(ctx context.Context, jobType string, payload []byte, opts ...queue.PushOption) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	cfg := queue.ResolvePushConfig(opts)
 
 	d.mu.Lock()
@@ -63,7 +67,11 @@ func (d *Driver) Push(_ context.Context, jobType string, payload []byte, opts ..
 
 // Pop retrieves and reserves the next available job from the named queue.
 // Returns nil, nil when no job is available.
-func (d *Driver) Pop(_ context.Context, queueName string) (*queue.QueuedJob, error) {
+func (d *Driver) Pop(ctx context.Context, queueName string) (*queue.QueuedJob, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -98,7 +106,11 @@ func (d *Driver) Pop(_ context.Context, queueName string) (*queue.QueuedJob, err
 }
 
 // Delete removes a completed job from the queue (idempotent).
-func (d *Driver) Delete(_ context.Context, id string) error {
+func (d *Driver) Delete(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -128,7 +140,11 @@ func (d *Driver) findByID(id string) (*entry, int) {
 
 // Release puts a job back on the queue with an updated availableAt and a new ID
 // (preserving FIFO ordering). Attempts count is preserved.
-func (d *Driver) Release(_ context.Context, id string, delay time.Duration) error {
+func (d *Driver) Release(ctx context.Context, id string, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -167,7 +183,11 @@ func (d *Driver) Release(_ context.Context, id string, delay time.Duration) erro
 }
 
 // Size returns the total number of jobs on the named queue (includes reserved and delayed).
-func (d *Driver) Size(_ context.Context, queueName string) (int, error) {
+func (d *Driver) Size(ctx context.Context, queueName string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -181,7 +201,11 @@ func (d *Driver) Size(_ context.Context, queueName string) (int, error) {
 }
 
 // Failed moves a job to the failed store and removes it from active jobs.
-func (d *Driver) Failed(_ context.Context, job *queue.QueuedJob, errMsg string) error {
+func (d *Driver) Failed(ctx context.Context, job *queue.QueuedJob, errMsg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
