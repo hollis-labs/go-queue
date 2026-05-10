@@ -4,7 +4,9 @@ A lightweight, driver-based job queue for Go. `go-queue` defines a small `Queue`
 
 ## Status
 
-Beta. The public API appears stable, the module is tagged `v0.1.0`, and all three drivers plus the worker are covered by tests. No `CHANGELOG.md` or public release notes are present, so API churn guarantees are unclear.
+Pre-1.0 (`v0.1.x`). The public API is stable in shape — `Queue`, `Worker`, `WorkerOpts`, the driver packages — but minor breaks may still happen between `v0.x` releases. See [`CHANGELOG.md`](CHANGELOG.md) for per-release detail and pin a version in your `go.mod`.
+
+Documentation: [pkg.go.dev/github.com/hollis-labs/go-queue](https://pkg.go.dev/github.com/hollis-labs/go-queue).
 
 ## Install
 
@@ -109,13 +111,11 @@ The SQLite driver uses a monotonically increasing `id` with explicit `queue`, `r
 
 ## Dependencies
 
-Framework-internal: none.
+Direct:
 
-External (direct):
+- [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) — pure-Go SQLite driver used by `driver/sqlite` and its tests. Pinned in `go.mod`.
 
-- `modernc.org/sqlite` v1.48.1 — pure-Go SQLite driver used by `driver/sqlite` and its tests.
-
-All other entries in `go.sum` are transitive dependencies of `modernc.org/sqlite`.
+All other entries in `go.sum` are transitive dependencies of `modernc.org/sqlite`. The root package and the `memory`/`noop` drivers have no external dependencies.
 
 ## Testing
 
@@ -125,6 +125,8 @@ go test ./...
 
 The SQLite driver tests use `:memory:` databases via the pure-Go `modernc.org/sqlite` driver, so no CGO toolchain or external SQLite install is required. No environment variables, fixtures, or external services are needed.
 
+For runnable end-to-end examples, see the [`examples/`](examples/) directory.
+
 ## License
 
-MIT License
+[MIT](LICENSE) © Hollis Labs.
