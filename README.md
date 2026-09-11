@@ -4,7 +4,7 @@ A lightweight, driver-based job queue for Go. `go-queue` defines a small `Queue`
 
 ## Status
 
-Pre-1.0 (`v0.1.x`). The public API is stable in shape — `Queue`, `Worker`, `WorkerOpts`, the driver packages — but minor breaks may still happen between `v0.x` releases. See [`CHANGELOG.md`](CHANGELOG.md) for per-release detail and pin a version in your `go.mod`.
+Pre-1.0 (`v0.2.x`). The public API is stable in shape — `Queue`, `Worker`, `WorkerOpts`, the driver packages — but minor breaks may still happen between `v0.x` releases. See [`CHANGELOG.md`](CHANGELOG.md) for per-release detail and pin a version in your `go.mod`.
 
 Documentation: [pkg.go.dev/github.com/hollis-labs/go-queue](https://pkg.go.dev/github.com/hollis-labs/go-queue).
 

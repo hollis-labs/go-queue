@@ -4,6 +4,39 @@ All notable changes to `go-queue` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.2.0 — 2026-09-11
+
+Additive. `nil` behaviour is identical to `v0.1.0`, so upgrading requires no
+source change.
+
+### Added
+
+- `WorkerOpts.CanReserve func(context.Context) bool` — an optional gate asked
+  once per poll cycle, before the worker reserves a job. Returning false skips
+  the cycle: nothing is reserved, the worker sleeps `PollInterval`, and it asks
+  again. `nil` means always eligible, which is how every worker behaved before
+  this option existed.
+
+  Written for deference between processes sharing a queue — a leader that owns
+  the work, a maintenance window, a drain-down before shutdown.
+
+  It gates only *new* reservations: a job already held runs to completion under
+  a live context. That is the distinction from cancelling the worker's context,
+  which aborts the handler mid-flight and then fails the bookkeeping after it,
+  leaving the job reserved and its attempt spent.
+
+### Notes
+
+- **`CanReserve` and `StopWhenEmpty` interact.** A gated cycle never inspects
+  the queue, so it cannot conclude the queue is drained and will not trigger
+  `StopWhenEmpty`. A worker told it may not reserve is deferring, not finished,
+  and waits rather than exiting.
+- The gate is called on the polling goroutine and must not block for long or
+  panic. This package recovers panics nowhere — not in handlers either — so one
+  raised in the gate takes down the polling goroutine.
+- `WorkerOpts.MaxMemoryMB` remains declared but not honoured, unchanged from
+  `v0.1.0`.
+
 ## v0.1.0 — 2026-05-10
 
 First public release. The previous private `v0.1.0` / `v0.1.1` / `v0.1.2`
