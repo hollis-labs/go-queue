@@ -54,3 +54,14 @@ retroactively change jobs already queued.
 The no-op driver must remain a real implementation of the interface, not a
 panic stub — it is what lets a service disable queueing without branching at
 every call site.
+
+`WorkerOpts.CanReserve` gates whether a NEW reservation is attempted, and
+nothing else. A nil hook must behave exactly as a worker built before the
+option existed (`TestWorkerCanReserveNilIsUnchangedBehavior`), and a hook that
+closes while a handler is running must let that handler finish and record its
+completion (`TestWorkerCanReserveDoesNotAbandonWorkInFlight`). The second is
+the whole point: a caller that wanted "stop taking work" could otherwise only
+cancel the worker's context, and pollLoop hands that same context to the
+handler and to the Delete/Release that follows it — so cancelling aborts a job
+mid-flight and then fails to record the outcome, leaving it reserved with an
+attempt spent.

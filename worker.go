@@ -32,6 +32,37 @@ type WorkerOpts struct {
 	// StopWhenEmpty exits after the queue is drained. Default: false.
 	StopWhenEmpty bool
 
+	// CanReserve, when non-nil, is asked once per poll cycle whether this
+	// worker may take work right now. Returning false skips the cycle: nothing
+	// is reserved, the worker sleeps PollInterval, and it asks again.
+	//
+	// It gates ONLY new reservations. A job already held runs to completion
+	// under a live context, which is the difference between "stop taking work"
+	// and "abandon work in progress" — and the reason this is a gate rather
+	// than something a caller can approximate by cancelling the worker's
+	// context. Cancelling aborts the handler mid-flight and then fails the
+	// bookkeeping that follows it, leaving the job reserved and its attempt
+	// spent.
+	//
+	// Written for deference between processes that share a queue: a leader that
+	// owns the work, a maintenance window, or a drain-down before shutdown. The
+	// canonical case is a long-lived service and short-lived helpers on one
+	// database, where only the service should run jobs while it is alive.
+	//
+	// nil means always eligible, which is exactly how every worker behaved
+	// before this option existed.
+	//
+	// Called on the polling goroutine, so it should be cheap and must not
+	// block for long — a slow check delays every cycle. It must not panic:
+	// this package does not recover panics anywhere, here or in handlers, and
+	// one raised here would take down the polling goroutine.
+	//
+	// Interaction with StopWhenEmpty, stated because it is a real corner: a
+	// gated cycle never inspects the queue, so it cannot conclude the queue is
+	// drained and will not trigger StopWhenEmpty. A worker told it may not
+	// reserve is deferring, not finished, and it waits rather than exiting.
+	CanReserve func(ctx context.Context) bool
+
 	// Lifecycle callbacks.
 	OnProcessing func(job *QueuedJob)
 	OnProcessed  func(job *QueuedJob)
@@ -96,6 +127,17 @@ func (w *Worker) pollLoop(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Ask before reserving. Checked here rather than after popNextJob so a
+		// gated worker never holds a job it is not allowed to run.
+		if w.opts.CanReserve != nil && !w.opts.CanReserve(ctx) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(w.opts.PollInterval):
+				continue
+			}
 		}
 
 		job := w.popNextJob(ctx)
