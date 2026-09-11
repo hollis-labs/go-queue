@@ -351,3 +351,181 @@ func TestWorkerPerJobMaxTries(t *testing.T) {
 		t.Fatalf("expected 1 failed job, got %d", len(failed))
 	}
 }
+
+// TestWorkerCanReserveGatesReservation covers the gate's three states against
+// the durable driver: closed takes nothing, open takes work, and nil behaves
+// exactly as a worker built before the option existed.
+//
+// The assertion is on `attempts`, which the driver increments inside Pop. That
+// makes it a direct observation of whether this worker RESERVED anything,
+// rather than an inference from whether a handler happened to run.
+func TestWorkerCanReserveGatesReservation(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:canreserve?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	q, err := qsqlite.New(db, qsqlite.Opts{})
+	if err != nil {
+		t.Fatalf("new driver: %v", err)
+	}
+	if err := q.Push(ctx, "gated", []byte(`{}`)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	var open atomic.Bool
+	var handled atomic.Int64
+	w := queue.NewWorker(q, queue.WorkerOpts{
+		PollInterval: 5 * time.Millisecond,
+		CanReserve:   func(context.Context) bool { return open.Load() },
+	})
+	w.Register("gated", func(context.Context, *queue.QueuedJob) error {
+		handled.Add(1)
+		return nil
+	})
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = w.Start(runCtx) }()
+
+	// Closed: the job must sit untouched. attempts stays 0 because Pop is never
+	// reached.
+	time.Sleep(80 * time.Millisecond)
+	var attempts, present int
+	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(attempts), 0) FROM jobs WHERE type = 'gated'`).
+		Scan(&present, &attempts); err != nil {
+		t.Fatalf("read job state: %v", err)
+	}
+	// Three ways this can be wrong, and each gets said plainly: the job was
+	// reserved, the job was run, or the job is gone entirely because it was
+	// reserved AND run while the gate was closed.
+	if present == 0 {
+		t.Fatalf("the gated job left the queue entirely (handled=%d): it was reserved and completed "+
+			"while CanReserve returned false, so the gate is not consulted before reservation",
+			handled.Load())
+	}
+	if attempts != 0 || handled.Load() != 0 {
+		t.Fatalf("a gated worker reserved a job: attempts=%d handled=%d. CanReserve is not being "+
+			"consulted before reservation", attempts, handled.Load())
+	}
+
+	// Open: it must take the job promptly.
+	open.Store(true)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && handled.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if handled.Load() == 0 {
+		t.Fatal("the worker never took the job after the gate opened; a gate that cannot reopen is " +
+			"a stop, not a gate")
+	}
+	cancel()
+	<-done
+}
+
+// TestWorkerCanReserveNilIsUnchangedBehavior is the additive guarantee.
+//
+// Every worker built before this option existed passes nil by construction, so
+// nil has to mean exactly what no-option meant. If this ever diverges, the
+// change stopped being additive and every existing caller's behaviour moved.
+func TestWorkerCanReserveNilIsUnchangedBehavior(t *testing.T) {
+	ctx := context.Background()
+	q := memory.New()
+	if err := q.Push(ctx, "plain", []byte(`{}`)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	var handled atomic.Int64
+	w := queue.NewWorker(q, queue.WorkerOpts{
+		StopWhenEmpty: true,
+		PollInterval:  5 * time.Millisecond,
+	})
+	w.Register("plain", func(context.Context, *queue.QueuedJob) error {
+		handled.Add(1)
+		return nil
+	})
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if handled.Load() != 1 {
+		t.Fatalf("a worker with no CanReserve handled %d jobs, want 1", handled.Load())
+	}
+}
+
+// TestWorkerCanReserveDoesNotAbandonWorkInFlight is the property the gate
+// exists to provide, and the reason it is a gate rather than a context cancel.
+//
+// The gate closes while a handler is running. That handler must finish, and its
+// completion must be recorded — the job deleted, not left reserved with an
+// attempt spent. Cancelling the worker's context instead would abort the
+// handler mid-call and then fail the Delete that follows it, because pollLoop
+// hands the same context to both.
+func TestWorkerCanReserveDoesNotAbandonWorkInFlight(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:canreserveinflight?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	q, err := qsqlite.New(db, qsqlite.Opts{})
+	if err != nil {
+		t.Fatalf("new driver: %v", err)
+	}
+	if err := q.Push(ctx, "slow", []byte(`{}`)); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	open := atomic.Bool{}
+	open.Store(true)
+	started := make(chan struct{})
+	finished := atomic.Bool{}
+
+	w := queue.NewWorker(q, queue.WorkerOpts{
+		PollInterval: 5 * time.Millisecond,
+		CanReserve:   func(context.Context) bool { return open.Load() },
+	})
+	w.Register("slow", func(hctx context.Context, _ *queue.QueuedJob) error {
+		close(started)
+		// The gate closes underneath this handler.
+		time.Sleep(120 * time.Millisecond)
+		if hctx.Err() != nil {
+			t.Errorf("the handler's context was cancelled mid-job: %v. A closing gate must not "+
+				"abandon work already reserved", hctx.Err())
+		}
+		finished.Store(true)
+		return nil
+	})
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _ = w.Start(runCtx) }()
+
+	<-started
+	open.Store(false)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !finished.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !finished.Load() {
+		t.Fatal("the in-flight handler never completed after the gate closed")
+	}
+
+	// And the completion was recorded: the job is gone rather than left
+	// reserved for the driver to reclaim later with an attempt spent.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE type = 'slow'`).Scan(&n); err == nil && n == 0 {
+			cancel()
+			<-done
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the completed job was still on the queue; its Delete did not run, so the attempt was " +
+		"spent and the job will be reclaimed and re-run")
+}
