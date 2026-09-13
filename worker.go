@@ -63,6 +63,12 @@ type WorkerOpts struct {
 	// reserve is deferring, not finished, and it waits rather than exiting.
 	CanReserve func(ctx context.Context) bool
 
+	// Controller optionally supports reversible whole-cycle draining. It gates
+	// before CanReserve and retains cycles through durable settlement and
+	// callbacks. Driver errors quarantine new cycles; nil preserves legacy
+	// behavior. One controller belongs to one worker, including across Starts.
+	Controller *CycleController
+
 	// Lifecycle callbacks.
 	OnProcessing func(job *QueuedJob)
 	OnProcessed  func(job *QueuedJob)
@@ -111,6 +117,9 @@ func (w *Worker) Register(jobType string, h Handler) {
 // Start begins polling. Blocks until ctx is cancelled or StopWhenEmpty
 // triggers. Returns nil on clean shutdown.
 func (w *Worker) Start(ctx context.Context) error {
+	if w.opts.Controller != nil {
+		return w.startControlled(ctx)
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < w.opts.Concurrency; i++ {
 		wg.Add(1)
@@ -162,7 +171,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			}
 		}
 
-		w.processJob(ctx, job)
+		w.processJob(ctx, job, nil)
 	}
 }
 
@@ -192,14 +201,17 @@ func (w *Worker) popNextJob(ctx context.Context) *QueuedJob {
 	return nil
 }
 
-func (w *Worker) processJob(ctx context.Context, job *QueuedJob) {
+func (w *Worker) processJob(ctx context.Context, job *QueuedJob, settled func(CycleOperation, error)) {
 	w.mu.RLock()
 	handler, ok := w.handlers[job.Type]
 	w.mu.RUnlock()
 
 	if !ok {
 		// No handler registered — permanent failure.
-		_ = w.queue.Failed(ctx, job, fmt.Sprintf("%v: %s", ErrHandlerNotFound, job.Type))
+		settleErr := w.queue.Failed(ctx, job, fmt.Sprintf("%v: %s", ErrHandlerNotFound, job.Type))
+		if settled != nil {
+			settled(OperationFailed, settleErr)
+		}
 		if w.opts.OnError != nil {
 			w.opts.OnError(fmt.Errorf("%w: %s", ErrHandlerNotFound, job.Type))
 		}
@@ -213,8 +225,11 @@ func (w *Worker) processJob(ctx context.Context, job *QueuedJob) {
 	err := handler(ctx, job)
 
 	if err == nil {
-		_ = w.queue.Delete(ctx, job.ID)
-		if w.opts.OnProcessed != nil {
+		settleErr := w.queue.Delete(ctx, job.ID)
+		if settled != nil {
+			settled(OperationDelete, settleErr)
+		}
+		if w.opts.OnProcessed != nil && (settled == nil || settleErr == nil) {
 			w.opts.OnProcessed(job)
 		}
 		return
@@ -227,13 +242,19 @@ func (w *Worker) processJob(ctx context.Context, job *QueuedJob) {
 	}
 
 	if maxTries > 0 && job.Attempts >= maxTries {
-		_ = w.queue.Failed(ctx, job, err.Error())
-		if w.opts.OnFailed != nil {
+		settleErr := w.queue.Failed(ctx, job, err.Error())
+		if settled != nil {
+			settled(OperationFailed, settleErr)
+		}
+		if w.opts.OnFailed != nil && (settled == nil || settleErr == nil) {
 			w.opts.OnFailed(job, err)
 		}
 		return
 	}
 
 	// Retry: release with delay.
-	_ = w.queue.Release(ctx, job.ID, w.opts.RetryAfter)
+	settleErr := w.queue.Release(ctx, job.ID, w.opts.RetryAfter)
+	if settled != nil {
+		settled(OperationRelease, settleErr)
+	}
 }

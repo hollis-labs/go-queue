@@ -90,7 +90,7 @@ Root package (`github.com/hollis-labs/go-queue`):
 - `QueuedJob` — struct returned by `Pop`, carrying `ID`, `Type`, `Queue`, `Payload`, `Attempts`, `MaxTries`, and timestamps.
 - `Handler` — `func(ctx context.Context, job *QueuedJob) error`; registered on a `Worker` by job-type string.
 - `Worker` / `NewWorker(q, opts)` — polls one or more queues and dispatches jobs to handlers.
-- `WorkerOpts` — `Queues`, `Concurrency`, `PollInterval`, `MaxTries`, `RetryAfter`, `MaxMemoryMB`, `StopWhenEmpty`, plus `OnProcessing`, `OnProcessed`, `OnFailed`, `OnError` lifecycle callbacks.
+- `WorkerOpts` — `Queues`, `Concurrency`, `PollInterval`, `MaxTries`, `RetryAfter`, `MaxMemoryMB`, `StopWhenEmpty`, `CanReserve`, optional `Controller`, plus `OnProcessing`, `OnProcessed`, `OnFailed`, `OnError` lifecycle callbacks.
 - `PushOption` helpers: `OnQueue(name)`, `WithDelay(d)`, `WithMaxTries(n)`.
 - `PushConfig` / `ResolvePushConfig(opts)` — exported so custom drivers can consume the resolved push options.
 - Sentinels: `ErrNoJob`, `ErrHandlerNotFound`.
@@ -102,6 +102,72 @@ Drivers:
 - `driver/noop` — `noop.New()` returns a `*Driver` that accepts pushes and drops them silently; `Pop` always returns `(nil, nil)`. Used when queueing is disabled.
 
 ## Architecture Notes
+
+### Reversible worker drain
+
+Pass a `*CycleController` to opt into whole-cycle pause and settlement tracking.
+The zero value is ready to use:
+
+```go
+controller := &queue.CycleController{}
+worker := queue.NewWorker(q, queue.WorkerOpts{Controller: controller})
+// Register handlers and run worker.Start(workerCtx) in its owning goroutine.
+
+pause := controller.Pause()
+report, err := controller.WaitQuiescent(waitCtx, pause)
+if err != nil {
+    // Inspect report internally. This resumes only the pause, not a fault.
+    _ = controller.Resume(pause)
+    return err
+}
+// This worker has no active cycles or unknown dispositions while pause is held.
+// Keep the handle held for the operation that requires quiescence.
+return controller.Resume(pause)
+```
+
+A cycle enrolls before `CanReserve` and `Pop`, and remains active through the
+handler, `Delete`/`Release`/`Failed`, and lifecycle callbacks. Thus pause cannot
+miss a poll that passed eligibility but has not reserved yet, or a handler
+whose result is not durably recorded. It does not cancel `workerCtx`. A canceled
+or expired `waitCtx` stops only the wait; the caller decides whether to resume.
+Callbacks must return before quiescence and must not wait on their own cycle.
+
+`Pause` is nonnesting: concurrent/repeated calls while paused share one handle.
+The caller must serialize ownership of `Resume`; one caller resuming releases
+that pause for every holder. A zero, foreign or retired handle returns
+`ErrStalePause`. One controller belongs permanently to one Worker, and concurrent
+Starts or reuse by another worker return `ErrControllerInUse`. A paused worker
+does not treat the queue as empty for `StopWhenEmpty`. Normal idle polling still
+obeys `PollInterval`; resume does not promise to interrupt an existing poll sleep.
+
+Managed cycles classify every driver error conservatively as `unknown`, even
+`Pop(nil, err)` or a read-only `Size` error: the existing driver interface has
+no richer outcome contract. An uncertain Pop may already have reserved a job,
+and retrying Release/Failed after a lost acknowledgement could repeat an effect.
+New cycles are quarantined as soon as the error is known; other enrolled cycles
+finish. There is no automatic settlement replay or fault reset, including across
+Starts of the same Worker. `Resume` may release a pause but cannot restore
+polling after a fault. Plan reconciliation separately instead of discarding the
+controller to claim a successful drain.
+
+`WaitQuiescent` returns `ErrUnknownDisposition` after all active cycles finish
+when any outcome remains uncertain. `CycleReport.Unknown` retains at most one
+record per polling goroutine; `Last` is the most recent completed cycle. Results
+name the operation, diagnostic cycle number, optional opaque job ID and original
+error. Reports are detached snapshots; they may contain private driver details
+and are **not safe wire/log payloads**. A report without a held pause is only an
+observation. There is no claim that the shared queue is empty or other workers
+are idle.
+
+In managed mode, settlement errors reach `OnError`; `OnProcessed` and `OnFailed`
+run only when their corresponding Delete/Failed succeeded. A missing handler
+still reaches `OnError` with `ErrHandlerNotFound`, even if Failed also errors.
+With `Controller:nil`, the prior behavior (including callbacks and handling of
+driver errors) is unchanged. Drivers, retry limits, FIFO/reclaim semantics and
+schema are unchanged. This API does not install a shutdown watcher or exit a
+consumer process.
+
+### Driver and worker ownership
 
 The split between `Queue` (driver contract) and `Worker` (dispatch loop) means consumers depend on the interface, not on a concrete backend. The worker owns policy — poll interval, concurrency, retry counting, priority ordering — while drivers own storage and reservation semantics.
 
