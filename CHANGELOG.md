@@ -4,6 +4,21 @@ All notable changes to `go-queue` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- The SQLite driver's `Pop`, `Release` and `Failed` now take the writer lock when
+  they begin (`BEGIN IMMEDIATE`, issued on a dedicated connection) instead of racing
+  for it at their first write. They used a deferred `BEGIN`, so two connections
+  could both read the same row and then collide on upgrade; under WAL that is
+  `SQLITE_BUSY_SNAPSHOT`, which `busy_timeout` does not retry, and callers saw
+  `database is locked`. It only showed up with more than one connection to a
+  file database, so the existing `:memory:` single-connection concurrency test
+  never exercised it. The driver no longer depends on how the caller opened the
+  pool (no `_txlock=immediate` needed). Internal locking only: no change to the
+  `Queue` interface, `Opts`, `New`, or the module's dependencies.
+
 ## v0.2.0 — 2026-09-11
 
 Additive. `nil` behaviour is identical to `v0.1.0`, so upgrading requires no

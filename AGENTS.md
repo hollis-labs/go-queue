@@ -44,7 +44,13 @@ stay safe across workers (`TestSQLiteConcurrentPop`), and stuck jobs — claimed
 by a worker that died — are reclaimed rather than lost
 (`TestSQLiteStuckJobReclaim`). It also creates its table on demand
 (`TestSQLiteTableAutoCreate`), so there is no separate migration step to keep
-in sync.
+in sync. Its
+transactions (`Pop`, `Release`, `Failed`) open with `BEGIN IMMEDIATE` on a
+dedicated connection through `withImmediate`, so the writer lock is taken at
+BEGIN whatever DSN the caller opened the pool with; every statement inside must
+use the `*sql.Conn` it is handed, never `d.db`. Only a multi-connection file
+database exercises this, which is why `TestSQLiteMultiConnectionContention` and
+`TestTransactionsTakeTheWriterLockAtBegin` use one rather than `:memory:`.
 
 `WithMaxTries(0)` means inherit from `WorkerOpts.MaxTries`, not "never retry".
 The resolved value is stored on the job at push time

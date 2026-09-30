@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -423,5 +425,196 @@ func TestSQLiteConcurrentPop(t *testing.T) {
 
 	if len(seen) != 100 {
 		t.Errorf("processed %d jobs, want 100", len(seen))
+	}
+}
+
+// newFileDB opens a real on-disk WAL database with several connections. The
+// bare ":memory:" helper above gives every connection its own empty database,
+// which is why TestSQLiteConcurrentPop has to pin one connection; that pins
+// away the writer-lock race this database shape is exposed to. Note the DSN
+// has no _txlock: the driver must not rely on how the caller opened the pool.
+func newFileDB(t *testing.T, conns int) *sql.DB {
+	t.Helper()
+	dsn := "file:" + filepath.Join(t.TempDir(), "queue.db") +
+		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	db.SetMaxOpenConns(conns)
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// Pop, Release and Failed take the writer lock at BEGIN (BEGIN IMMEDIATE). With
+// a deferred BEGIN, two connections read the same row and then collide when
+// they upgrade to write; under WAL that is SQLITE_BUSY_SNAPSHOT, which
+// busy_timeout does not retry, so callers see "database is locked" errors even
+// though the timeout is ten seconds here.
+func TestSQLiteMultiConnectionContention(t *testing.T) {
+	ctx := context.Background()
+	db := newFileDB(t, 8)
+	q, err := qsqlite.New(db, qsqlite.Opts{})
+	if err != nil {
+		t.Fatalf("new driver: %v", err)
+	}
+
+	const initial, pushed = 60, 40
+	for i := 0; i < initial; i++ {
+		if err := q.Push(ctx, "work", []byte(fmt.Sprintf("%d", i))); err != nil {
+			t.Fatalf("seed push: %v", err)
+		}
+	}
+
+	var (
+		mu        sync.Mutex
+		held      = map[string]bool{} // reserved and not yet released/deleted/failed
+		completed = map[string]int{}  // payload -> times it reached Delete or Failed
+		failedN   int
+	)
+	idx := func(j *queue.QueuedJob) int {
+		n, err := strconv.Atoi(string(j.Payload))
+		if err != nil {
+			t.Errorf("payload %q: %v", j.Payload, err)
+		}
+		return n
+	}
+	// work pops one job and settles it; it reports whether a job was popped.
+	work := func() bool {
+		job, err := q.Pop(ctx, "default")
+		if err != nil {
+			t.Errorf("Pop: %v", err)
+			return false
+		}
+		if job == nil {
+			return false
+		}
+		mu.Lock()
+		if held[job.ID] {
+			t.Errorf("job %s reserved twice at once", job.ID)
+		}
+		held[job.ID] = true
+		mu.Unlock()
+
+		n := idx(job)
+		settle := func() {
+			mu.Lock()
+			delete(held, job.ID)
+			mu.Unlock()
+		}
+		switch {
+		case n%3 == 0 && job.Attempts == 1:
+			settle()
+			if err := q.Release(ctx, job.ID, 0); err != nil {
+				t.Errorf("Release: %v", err)
+			}
+		case n%3 == 1:
+			settle()
+			if err := q.Failed(ctx, job, "boom"); err != nil {
+				t.Errorf("Failed: %v", err)
+				return true
+			}
+			mu.Lock()
+			completed[string(job.Payload)]++
+			failedN++
+			mu.Unlock()
+		default:
+			settle()
+			if err := q.Delete(ctx, job.ID); err != nil {
+				t.Errorf("Delete: %v", err)
+				return true
+			}
+			mu.Lock()
+			completed[string(job.Payload)]++
+			mu.Unlock()
+		}
+		return true
+	}
+
+	var pushers, workers sync.WaitGroup
+	pushersDone := make(chan struct{})
+	for p := 0; p < 2; p++ {
+		pushers.Add(1)
+		go func() {
+			defer pushers.Done()
+			for i := 0; i < pushed/2; i++ {
+				n := initial + p*(pushed/2) + i
+				if err := q.Push(ctx, "work", []byte(fmt.Sprintf("%d", n))); err != nil {
+					t.Errorf("Push: %v", err)
+				}
+			}
+		}()
+	}
+	go func() { pushers.Wait(); close(pushersDone) }()
+	for w := 0; w < 8; w++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				if work() {
+					continue
+				}
+				select {
+				case <-pushersDone:
+					return
+				default:
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	// A released job can re-enter after the last worker saw an empty queue.
+	for work() {
+	}
+
+	if t.Failed() {
+		return
+	}
+	total := initial + pushed
+	if len(completed) != total {
+		t.Errorf("%d distinct jobs completed, want %d", len(completed), total)
+	}
+	for payload, n := range completed {
+		if n != 1 {
+			t.Errorf("job %s completed %d times, want once", payload, n)
+		}
+	}
+	if size, err := q.Size(ctx, "default"); err != nil || size != 0 {
+		t.Errorf("Size = %d, %v; want 0", size, err)
+	}
+	var failedRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM failed_jobs`).Scan(&failedRows); err != nil || failedRows != failedN {
+		t.Errorf("failed_jobs = %d (%v), want %d", failedRows, err, failedN)
+	}
+}
+
+// The test above is only meaningful if the pool really has several connections
+// on one shared file: prove it, so a future edit to newFileDB cannot quietly
+// turn it back into a single-connection test.
+func TestNewFileDBSharesOneFileAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	db := newFileDB(t, 4)
+	if _, err := db.Exec(`CREATE TABLE t (x INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c1.Close() }()
+	c2, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	if _, err := c1.ExecContext(ctx, `INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := c2.QueryRowContext(ctx, `SELECT COUNT(*) FROM t`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("second connection sees %d rows (%v); connections are not sharing one file", n, err)
+	}
+	if got := db.Stats().MaxOpenConnections; got != 4 {
+		t.Fatalf("MaxOpenConnections = %d, want 4", got)
 	}
 }
