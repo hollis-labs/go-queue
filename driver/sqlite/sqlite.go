@@ -82,73 +82,68 @@ func (d *Driver) Pop(ctx context.Context, queueName string) (*queue.QueuedJob, e
 		return nil, err
 	}
 
-	tx, err := d.db.BeginTx(ctx, nil)
+	var job *queue.QueuedJob
+	err := withImmediate(ctx, d.db, "sqlite pop", func(conn *sql.Conn) error {
+		now := time.Now().UTC().Unix()
+		retryThreshold := now - int64(d.retryAfter.Seconds())
+
+		var (
+			id          int64
+			jobType     string
+			jobPayload  []byte
+			attempts    int
+			maxTries    int
+			createdAt   int64
+			availableAt int64
+			reservedAt  *int64
+		)
+
+		err := conn.QueryRowContext(
+			ctx,
+			`SELECT id, type, payload, attempts, max_tries, created_at, available_at, reserved_at
+			 FROM `+d.table+`
+			 WHERE queue = ?
+			   AND ((reserved_at IS NULL AND available_at <= ?) OR (reserved_at IS NOT NULL AND reserved_at <= ?))
+			 ORDER BY id ASC
+			 LIMIT 1`,
+			queueName, now, retryThreshold,
+		).Scan(&id, &jobType, &jobPayload, &attempts, &maxTries, &createdAt, &availableAt, &reservedAt)
+		if err == sql.ErrNoRows {
+			return nil // empty queue: nothing reserved, the empty transaction commits
+		}
+		if err != nil {
+			return fmt.Errorf("sqlite pop select: %w", err)
+		}
+
+		newAttempts := attempts + 1
+		if _, err := conn.ExecContext(
+			ctx,
+			`UPDATE `+d.table+` SET reserved_at = ?, attempts = ? WHERE id = ?`,
+			now, newAttempts, id,
+		); err != nil {
+			return fmt.Errorf("sqlite pop update: %w", err)
+		}
+
+		var reservedAtTime *time.Time
+		if reservedAt != nil {
+			t := time.Unix(*reservedAt, 0).UTC()
+			reservedAtTime = &t
+		}
+		job = &queue.QueuedJob{
+			ID:          fmt.Sprintf("%d", id),
+			Type:        jobType,
+			Queue:       queueName,
+			Payload:     jobPayload,
+			Attempts:    newAttempts,
+			MaxTries:    maxTries,
+			CreatedAt:   time.Unix(createdAt, 0).UTC(),
+			AvailableAt: time.Unix(availableAt, 0).UTC(),
+			ReservedAt:  reservedAtTime,
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("sqlite pop begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	now := time.Now().UTC().Unix()
-	retryThreshold := now - int64(d.retryAfter.Seconds())
-
-	var (
-		id          int64
-		jobType     string
-		jobPayload  []byte
-		attempts    int
-		maxTries    int
-		createdAt   int64
-		availableAt int64
-		reservedAt  *int64
-	)
-
-	err = tx.QueryRowContext(
-		ctx,
-		`SELECT id, type, payload, attempts, max_tries, created_at, available_at, reserved_at
-		 FROM `+d.table+`
-		 WHERE queue = ?
-		   AND ((reserved_at IS NULL AND available_at <= ?) OR (reserved_at IS NOT NULL AND reserved_at <= ?))
-		 ORDER BY id ASC
-		 LIMIT 1`,
-		queueName, now, retryThreshold,
-	).Scan(&id, &jobType, &jobPayload, &attempts, &maxTries, &createdAt, &availableAt, &reservedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("sqlite pop select: %w", err)
-	}
-
-	newAttempts := attempts + 1
-	_, err = tx.ExecContext(
-		ctx,
-		`UPDATE `+d.table+` SET reserved_at = ?, attempts = ? WHERE id = ?`,
-		now, newAttempts, id,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("sqlite pop update: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("sqlite pop commit: %w", err)
-	}
-
-	var reservedAtTime *time.Time
-	if reservedAt != nil {
-		t := time.Unix(*reservedAt, 0).UTC()
-		reservedAtTime = &t
-	}
-
-	job := &queue.QueuedJob{
-		ID:          fmt.Sprintf("%d", id),
-		Type:        jobType,
-		Queue:       queueName,
-		Payload:     jobPayload,
-		Attempts:    newAttempts,
-		MaxTries:    maxTries,
-		CreatedAt:   time.Unix(createdAt, 0).UTC(),
-		AvailableAt: time.Unix(availableAt, 0).UTC(),
-		ReservedAt:  reservedAtTime,
+		return nil, err
 	}
 	return job, nil
 }
@@ -172,52 +167,42 @@ func (d *Driver) Release(ctx context.Context, id string, delay time.Duration) er
 		return err
 	}
 
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlite release begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
+	return withImmediate(ctx, d.db, "sqlite release", func(conn *sql.Conn) error {
+		var (
+			jobType   string
+			queueName string
+			payload   []byte
+			attempts  int
+			maxTries  int
+			createdAt int64
+		)
 
-	var (
-		jobType   string
-		queueName string
-		payload   []byte
-		attempts  int
-		maxTries  int
-		createdAt int64
-	)
+		err := conn.QueryRowContext(
+			ctx,
+			`SELECT type, queue, payload, attempts, max_tries, created_at FROM `+d.table+` WHERE id = ?`,
+			id,
+		).Scan(&jobType, &queueName, &payload, &attempts, &maxTries, &createdAt)
+		if err != nil {
+			return fmt.Errorf("sqlite release select: %w", err)
+		}
 
-	err = tx.QueryRowContext(
-		ctx,
-		`SELECT type, queue, payload, attempts, max_tries, created_at FROM `+d.table+` WHERE id = ?`,
-		id,
-	).Scan(&jobType, &queueName, &payload, &attempts, &maxTries, &createdAt)
-	if err != nil {
-		return fmt.Errorf("sqlite release select: %w", err)
-	}
+		if _, err := conn.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("sqlite release delete: %w", err)
+		}
 
-	_, err = tx.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("sqlite release delete: %w", err)
-	}
+		now := time.Now().UTC().Unix()
+		availableAt := now + int64(delay.Seconds())
 
-	now := time.Now().UTC().Unix()
-	availableAt := now + int64(delay.Seconds())
-
-	_, err = tx.ExecContext(
-		ctx,
-		`INSERT INTO `+d.table+` (queue, type, payload, attempts, max_tries, available_at, created_at, reserved_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-		queueName, jobType, payload, attempts, maxTries, availableAt, createdAt,
-	)
-	if err != nil {
-		return fmt.Errorf("sqlite release insert: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite release commit: %w", err)
-	}
-	return nil
+		if _, err := conn.ExecContext(
+			ctx,
+			`INSERT INTO `+d.table+` (queue, type, payload, attempts, max_tries, available_at, created_at, reserved_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+			queueName, jobType, payload, attempts, maxTries, availableAt, createdAt,
+		); err != nil {
+			return fmt.Errorf("sqlite release insert: %w", err)
+		}
+		return nil
+	})
 }
 
 // Size returns the total number of jobs on the named queue.
@@ -244,30 +229,20 @@ func (d *Driver) Failed(ctx context.Context, job *queue.QueuedJob, errMsg string
 		return err
 	}
 
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("sqlite failed begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
+	return withImmediate(ctx, d.db, "sqlite failed", func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE id = ?`, job.ID); err != nil {
+			return fmt.Errorf("sqlite failed delete: %w", err)
+		}
 
-	_, err = tx.ExecContext(ctx, `DELETE FROM `+d.table+` WHERE id = ?`, job.ID)
-	if err != nil {
-		return fmt.Errorf("sqlite failed delete: %w", err)
-	}
-
-	now := time.Now().UTC().Unix()
-	_, err = tx.ExecContext(
-		ctx,
-		`INSERT INTO `+d.failedTable+` (queue, type, payload, error, attempts, failed_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		job.Queue, job.Type, job.Payload, errMsg, job.Attempts, now,
-	)
-	if err != nil {
-		return fmt.Errorf("sqlite failed insert: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite failed commit: %w", err)
-	}
-	return nil
+		now := time.Now().UTC().Unix()
+		if _, err := conn.ExecContext(
+			ctx,
+			`INSERT INTO `+d.failedTable+` (queue, type, payload, error, attempts, failed_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			job.Queue, job.Type, job.Payload, errMsg, job.Attempts, now,
+		); err != nil {
+			return fmt.Errorf("sqlite failed insert: %w", err)
+		}
+		return nil
+	})
 }
