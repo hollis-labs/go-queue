@@ -1,5 +1,22 @@
 # go-queue
 
+## Maintenance moved to `github.com/hollis-labs/libs/util`
+
+This standalone repository is retired. Maintained source and documentation are
+in [github.com/hollis-labs/libs/util/queue](https://github.com/hollis-labs/libs/tree/util%2Fv0.1.0/util/queue), released in **`util/v0.1.0`**.
+Install the replacement module:
+
+```sh
+go get github.com/hollis-labs/libs/util@v0.1.0
+```
+
+Replace the `github.com/hollis-labs/go-queue` import prefix with
+`github.com/hollis-labs/libs/util/queue`, retaining the package subpath. Review the replacement documentation
+for any API changes before migrating. Existing standalone tags and history remain
+available; old module pins do not automatically redirect to the new module.
+
+The documentation below describes historical standalone usage.
+
 A lightweight, driver-based job queue for Go. `go-queue` defines a small `Queue` interface and ships three backends — SQLite, in-memory, and no-op — along with a `Worker` that polls one or more named queues and dispatches jobs to registered handlers with retry, per-job max attempts, priority ordering across queues, and graceful shutdown via `context.Context`. It is intended for services that want Laravel-style background jobs without a broker such as Redis or RabbitMQ.
 
 ## Status
